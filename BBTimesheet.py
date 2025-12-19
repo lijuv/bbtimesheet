@@ -499,9 +499,9 @@ def make_export_excel(summary_df: pd.DataFrame, details_by_emp: Dict[str, pd.Dat
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="Timesheet → Payroll (NZ, Fortnightly)", layout="wide")
+st.set_page_config(page_title="LiquorPanda Timesheet → Payroll (NZ, Fortnightly)", layout="wide")
 
-st.title("Timesheet → Payroll (NZ, Fortnightly)")
+st.title("iquorPanda Timesheet → Payroll (NZ, Fortnightly)")
 st.caption(
     "Reads an Excel workbook with one sheet per employee, calculates hours, detects overlaps, and produces a PAYE-based pay summary."
 )
@@ -796,3 +796,4 @@ st.caption(
     "Public holiday identification uses the Python 'holidays' library where available. "
     "Public holiday pay is calculated as 1.5x for worked hours; alternative day accrual is noted conceptually but not booked as cash."
 )
+
