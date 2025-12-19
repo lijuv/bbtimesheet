@@ -505,7 +505,7 @@ st.title("LiquorPanda Timesheet → Payroll (NZ, Fortnightly)")
 st.caption(
     "Reads an Excel workbook with one sheet per employee, calculates hours, detects overlaps, and produces a PAYE-based pay summary."
     st.caption(
-    "Created by Liju Varghese(Aitechs Solutions)"
+    "Created by Liju Varghese(Aitechs Solutions))"
 )
 
 with st.expander("Reference: your processed pay summary (for QA)"):
@@ -798,5 +798,6 @@ st.caption(
     "Public holiday identification uses the Python 'holidays' library where available. "
     "Public holiday pay is calculated as 1.5x for worked hours; alternative day accrual is noted conceptually but not booked as cash."
 )
+
 
 
