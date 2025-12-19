@@ -1,7 +1,21 @@
+# app.py
+# Timesheet → Payroll (NZ, Fortnightly) — Streamlit Community Cloud ready
+# - Reads an uploaded Excel workbook where each employee is a sheet
+# - Robustly detects headers (even if the real header row is not row 1)
+# - Supports multiple column name variants (Login/Logout, Clock In/Out, Start/Finish, etc.)
+# - Cycle selection works for ANY past/future date using a fixed 14-day anchor cycle
+# - Detects overlaps between employees
+# - Computes ordinary + public-holiday pay (1.5x if worked) + optional 8% holiday pay
+# - Estimates PAYE using annualised IRD bracket method + ACC earners levy (close; not IR340 table lookup)
+# - Exports a single Excel file with Summary, Overlaps, and per-employee details
+#
+# IMPORTANT: Streamlit Cloud should run Python 3.11 (add runtime.txt = "python-3.11")
+
 from __future__ import annotations
 
 import io
 import re
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from math import floor
@@ -11,11 +25,11 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+
 # -----------------------------
-# NZ PAYROLL CONSTANTS (2025/26)
+# NZ PAYROLL CONSTANTS (adjust if needed)
 # -----------------------------
-# IRD "From 1 April 2025" individual tax brackets. (Applies to 2025/26 tax year.)
-# Source: IRD tax rates for individuals (from 1 April 2025). See citations in assistant message.
+# These are the IRD individual tax brackets from 1 Apr 2025 onwards (annual). (Approx PAYE method)
 TAX_BRACKETS_FROM_2025_04_01 = [
     (0.00, 15600.00, 0.105),
     (15600.00, 53500.00, 0.175),
@@ -24,20 +38,18 @@ TAX_BRACKETS_FROM_2025_04_01 = [
     (180000.00, float("inf"), 0.39),
 ]
 
-# ACC earners' levy (includes GST) and maximum liable earnings for 1 Apr 2025 to 31 Mar 2026.
+# ACC earners levy (1 Apr 2025 to 31 Mar 2026)
 ACC_EARNERS_LEVY_RATE = 0.0167
 ACC_MAX_EARNINGS = 152790.00
 
-# Fortnightly pay frequency
-PAY_PERIODS_PER_YEAR = 26
+PAY_PERIODS_PER_YEAR = 26  # fortnightly
 
 
 # -----------------------------
-# Helpers
+# Utility helpers
 # -----------------------------
 def _floor2(x: float) -> float:
-    """Floor to cents (conservative)."""
-    return floor(x * 100.0) / 100.0
+    return floor(float(x) * 100.0) / 100.0
 
 
 def _round2(x: float) -> float:
@@ -45,42 +57,35 @@ def _round2(x: float) -> float:
 
 
 def excel_serial_to_date(x: float) -> date:
-    # Excel serial date origin (Windows): 1899-12-30
     base = datetime(1899, 12, 30)
     return (base + timedelta(days=float(x))).date()
 
 
 def parse_break_to_minutes(v) -> int:
-    """Break column examples: NaN, 30, '30 mins', '00:30:00'."""
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return 0
     if isinstance(v, (int, np.integer)):
         return int(v)
     if isinstance(v, (float, np.floating)):
-        # if it's a fraction (Excel time), treat as days
-        if 0 < v < 1:
-            return int(round(v * 24 * 60))
-        return int(round(v))
+        if 0 < float(v) < 1:
+            return int(round(float(v) * 24 * 60))
+        return int(round(float(v)))
     if isinstance(v, timedelta):
         return int(v.total_seconds() // 60)
     if isinstance(v, str):
         s = v.strip().lower()
         if not s:
             return 0
-        # "30 mins", "30 min", "30m"
         m = re.search(r"(\d+)\s*(mins?|minutes?|m)\b", s)
         if m:
             return int(m.group(1))
-        # "00:30:00"
         m = re.match(r"^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$", s)
         if m:
             hh = int(m.group(1))
             mm = int(m.group(2))
             return hh * 60 + mm
-        # "0.5" hours maybe
         try:
             f = float(s)
-            # treat as minutes if big; else hours
             if f <= 8:
                 return int(round(f * 60))
             return int(round(f))
@@ -90,7 +95,11 @@ def parse_break_to_minutes(v) -> int:
 
 
 def parse_time_value(v) -> Optional[time]:
-    """Accepts time, datetime, string, excel fractions."""
+    """
+    Accepts: datetime/time/pandas Timestamp/timedelta, Excel fraction, strings like:
+      - "16:30", "16:30:00"
+      - "9 AM", "9:00 PM", "09:15 am"
+    """
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return None
     if isinstance(v, time):
@@ -106,9 +115,9 @@ def parse_time_value(v) -> Optional[time]:
         ss = secs % 60
         return time(hh, mm, ss)
     if isinstance(v, (int, float, np.integer, np.floating)):
-        # Excel time fraction of a day
-        if 0 <= float(v) < 1:
-            secs = int(round(float(v) * 24 * 3600))
+        vv = float(v)
+        if 0 <= vv < 1:
+            secs = int(round(vv * 24 * 3600))
             hh = (secs // 3600) % 24
             mm = (secs % 3600) // 60
             ss = secs % 60
@@ -118,39 +127,62 @@ def parse_time_value(v) -> Optional[time]:
         s = v.strip()
         if not s:
             return None
+
+        # HH:MM(:SS)
         m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$", s)
         if m:
             hh = int(m.group(1))
             mm = int(m.group(2))
             ss = int(m.group(3) or 0)
-            return time(hh, mm, ss)
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                return time(hh, mm, ss)
+
+        # "9 AM" / "9:15 pm"
+        m = re.match(r"^\s*(\d{1,2})(?::(\d{2}))?\s*([aApP][mM])\s*$", s)
+        if m:
+            hh = int(m.group(1))
+            mm = int(m.group(2) or 0)
+            ap = m.group(3).lower()
+            if hh == 12:
+                hh = 0
+            if ap == "pm":
+                hh += 12
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                return time(hh, mm, 0)
+
+        # try pandas parser
+        try:
+            ts = pd.to_datetime(s)
+            return ts.to_pydatetime().time()
+        except Exception:
+            return None
+
     return None
 
 
 def parse_duration_to_hours(v) -> Optional[float]:
-    """For Total Hours column like '11:30:00' or numeric hours."""
+    """
+    For Total Hours fields: supports numeric, Excel fraction, "11:30:00", "11:30"
+    """
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return None
     if isinstance(v, timedelta):
         return v.total_seconds() / 3600.0
     if isinstance(v, (int, float, np.integer, np.floating)):
-        # If it looks like an Excel time fraction, convert to hours
-        if 0 < float(v) < 1:
-            return float(v) * 24.0
-        # else assume already hours
-        return float(v)
+        vv = float(v)
+        if 0 < vv < 1:
+            return vv * 24.0
+        return vv
     if isinstance(v, str):
         s = v.strip()
         if not s:
             return None
-        # HH:MM:SS
-        m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$", s)
+        m = re.match(r"^(\d{1,3}):(\d{2})(?::(\d{2}))?\s*$", s)
         if m:
             hh = int(m.group(1))
             mm = int(m.group(2))
             ss = int(m.group(3) or 0)
             return hh + mm / 60.0 + ss / 3600.0
-        # "5.5" etc
         try:
             return float(s)
         except Exception:
@@ -159,20 +191,76 @@ def parse_duration_to_hours(v) -> Optional[float]:
 
 
 def normalise_sheet_name_to_employee(sheet_name: str) -> str:
-    s = re.sub(r"\s+", " ", sheet_name).strip()
-    # remove common prefixes
+    s = re.sub(r"\s+", " ", str(sheet_name)).strip()
     s = re.sub(r"^(timesheet|time sheet)\s*[-:]*\s*", "", s, flags=re.IGNORECASE).strip()
-    return s or sheet_name.strip()
+    return s or str(sheet_name).strip()
+
+
+def cycle_from_date(anchor: date, any_date: date) -> Tuple[int, date, date]:
+    """Return (cycle_index, cycle_start, cycle_end) for a given date using 14-day cycles."""
+    delta_days = (any_date - anchor).days
+    k = math.floor(delta_days / 14)
+    start = anchor + timedelta(days=14 * k)
+    end = start + timedelta(days=13)
+    return k, start, end
+
+
+def annual_income_tax(income_annual: float) -> float:
+    tax = 0.0
+    for lo, hi, rate in TAX_BRACKETS_FROM_2025_04_01:
+        if income_annual > lo:
+            taxable = min(income_annual, hi) - lo
+            tax += taxable * rate
+        else:
+            break
+    return tax
+
+
+def compute_paye_fortnightly(gross_fortnight: float) -> float:
+    """
+    Approx PAYE = (annual tax + annual ACC) / 26 (floored to cents).
+    If you need cent-perfect matching to Xero, replace this with IR340 table lookup.
+    """
+    annual_income = float(gross_fortnight) * PAY_PERIODS_PER_YEAR
+    tax_a = annual_income_tax(annual_income)
+    acc_a = min(annual_income, ACC_MAX_EARNINGS) * ACC_EARNERS_LEVY_RATE
+    tax_a = _floor2(tax_a)
+    acc_a = _floor2(acc_a)
+    paye = (tax_a + acc_a) / PAY_PERIODS_PER_YEAR
+    return _floor2(paye)
+
+
+def get_nz_public_holidays(years: List[int]) -> Dict[date, str]:
+    """
+    Uses holidays package if available; otherwise returns empty map.
+    """
+    try:
+        import holidays  # type: ignore
+        nz = holidays.country_holidays("NZ", years=years)
+        return {d: str(name) for d, name in nz.items()}
+    except Exception:
+        return {}
 
 
 def find_header_row(df_raw: pd.DataFrame) -> int:
-    """Find row index containing 'Date' and 'Login' tokens."""
-    for i in range(min(len(df_raw), 60)):
-        row = df_raw.iloc[i].astype(str).str.strip().str.lower()
-        if any(x == "date" for x in row.values) and any("login" in x for x in row.values):
+    """
+    Attempt to locate the real header row in messy sheets.
+    Heuristic: look for a row containing something like 'date' + login/clock in/start + logout/clock out/finish.
+    """
+    def norm_cell(x) -> str:
+        return str(x).strip().lower()
+
+    for i in range(min(len(df_raw), 80)):
+        row = df_raw.iloc[i].apply(norm_cell).tolist()
+        has_date = any(c == "date" or "date" == c for c in row)
+        has_in = any(("login" in c) or ("clock in" in c) or (c == "in") or ("start" in c) for c in row)
+        has_out = any(("logout" in c) or ("clock out" in c) or (c == "out") or ("finish" in c) or ("end" in c) for c in row)
+        has_total = any(("total" in c and ("hour" in c or "hrs" in c)) or c in ("total hours", "hours") for c in row)
+        if has_date and (has_total or (has_in and has_out)):
             return i
-    # fallback: first non-empty row
-    for i in range(min(len(df_raw), 60)):
+
+    # fallback: first row with at least 2 non-empty cells
+    for i in range(min(len(df_raw), 80)):
         if df_raw.iloc[i].notna().sum() >= 2:
             return i
     return 0
@@ -180,17 +268,15 @@ def find_header_row(df_raw: pd.DataFrame) -> int:
 
 def standardise_timesheet_df(df_any: pd.DataFrame) -> pd.DataFrame:
     """
-    Returns a clean DF with columns:
-    - EmployeeDate (date)
-    - Login (time)
-    - Logout (time)
-    - BreakMinutes (int)
-    - Hours (float)
-    - ShiftStart (datetime)
-    - ShiftEnd (datetime)
+    Returns clean DF with:
+      Date (datetime64[ns] date at midnight)
+      ShiftStart (datetime)
+      ShiftEnd (datetime)
+      BreakMinutes (int)
+      Hours (float)
     """
-    # If columns are all Unnamed, treat as raw with header rows inside.
-    if all(str(c).lower().startswith("unnamed") for c in df_any.columns):
+    # If columns are mostly Unnamed, treat as raw with header embedded
+    if len(df_any.columns) >= 1 and all(str(c).lower().startswith("unnamed") for c in df_any.columns):
         df_raw = df_any.copy()
         hdr_idx = find_header_row(df_raw)
         header = df_raw.iloc[hdr_idx].astype(str).str.strip()
@@ -199,30 +285,39 @@ def standardise_timesheet_df(df_any: pd.DataFrame) -> pd.DataFrame:
     else:
         df = df_any.copy()
 
-    # Normalise column names
+    # Normalize column names with wide synonyms
     col_map = {}
     for c in df.columns:
         cl = str(c).strip().lower()
-        if cl == "date":
+
+        # Date
+        if cl == "date" or "date" == cl:
             col_map[c] = "Date"
-        elif "login" in cl or "clock in" in cl or cl == "in":
+        elif "work date" in cl:
+            col_map[c] = "Date"
+
+        # Login / Start
+        elif ("login" in cl) or ("clock in" in cl) or (cl in ("in", "in time")) or ("start" in cl) or ("time in" in cl):
             col_map[c] = "Login"
-        elif "logout" in cl or "clock out" in cl or cl == "out":
+
+        # Logout / Finish
+        elif ("logout" in cl) or ("clock out" in cl) or (cl in ("out", "out time")) or ("finish" in cl) or ("end" in cl) or ("time out" in cl):
             col_map[c] = "Logout"
-        elif "break" in cl:
+
+        # Break
+        elif ("break" in cl) or ("meal" in cl) or ("lunch" in cl):
             col_map[c] = "Break"
-        elif "total" in cl and "hour" in cl:
+
+        # Total Hours
+        elif (("total" in cl and ("hour" in cl or "hrs" in cl)) or (cl == "total hours") or (cl == "hours") or ("worked hours" in cl)):
             col_map[c] = "Total Hours"
-        elif cl == "total hours":
-            col_map[c] = "Total Hours"
-        elif "hours" == cl:
-            col_map[c] = "Total Hours"
+
         else:
-            col_map[c] = str(c)
+            col_map[c] = str(c).strip()
 
     df = df.rename(columns=col_map)
 
-    # Keep relevant columns if present
+    # Keep only relevant columns if present
     keep = [c for c in ["Date", "Login", "Logout", "Break", "Total Hours"] if c in df.columns]
     df = df[keep].copy()
 
@@ -240,40 +335,39 @@ def standardise_timesheet_df(df_any: pd.DataFrame) -> pd.DataFrame:
         if isinstance(v, pd.Timestamp):
             return v.to_pydatetime().date()
         if isinstance(v, (int, float, np.integer, np.floating)):
-            # excel serial
             return excel_serial_to_date(v)
         if isinstance(v, str):
             s = v.strip()
             if not s:
                 return None
             try:
-                return pd.to_datetime(s).date()
+                return pd.to_datetime(s, dayfirst=False).date()
             except Exception:
                 return None
         return None
 
-    df["EmployeeDate"] = df["Date"].apply(_to_date)
+    df["D"] = df["Date"].apply(_to_date)
 
     # Parse times
     df["Login_t"] = df["Login"].apply(parse_time_value) if "Login" in df.columns else None
     df["Logout_t"] = df["Logout"].apply(parse_time_value) if "Logout" in df.columns else None
 
-    # Break
+    # Break minutes
     df["BreakMinutes"] = df["Break"].apply(parse_break_to_minutes) if "Break" in df.columns else 0
 
-    # Hours calculation
-    total_hours = df["Total Hours"].apply(parse_duration_to_hours) if "Total Hours" in df.columns else None
+    # Total hours if present
+    th = df["Total Hours"].apply(parse_duration_to_hours) if "Total Hours" in df.columns else None
 
     hours_list = []
     start_list = []
     end_list = []
 
     for i in range(len(df)):
-        d = df.iloc[i]["EmployeeDate"]
+        d = df.iloc[i]["D"]
         lt = df.iloc[i]["Login_t"]
         ot = df.iloc[i]["Logout_t"]
         br = int(df.iloc[i]["BreakMinutes"] or 0)
-        th = None if total_hours is None else total_hours.iloc[i]
+        total_h = None if th is None else th.iloc[i]
 
         if d is None:
             hours_list.append(np.nan)
@@ -281,25 +375,17 @@ def standardise_timesheet_df(df_any: pd.DataFrame) -> pd.DataFrame:
             end_list.append(pd.NaT)
             continue
 
-        # shift start/end
-        if lt is not None:
-            shift_start = datetime.combine(d, lt)
-        else:
-            shift_start = pd.NaT
+        shift_start = datetime.combine(d, lt) if lt is not None else pd.NaT
 
         if ot is not None:
             shift_end = datetime.combine(d, ot)
-            # handle overnight (logout < login)
             if lt is not None and ot < lt:
-                shift_end = shift_end + timedelta(days=1)
+                shift_end = shift_end + timedelta(days=1)  # overnight
         else:
             shift_end = pd.NaT
 
-        # choose hours source:
-        # - if Total Hours is present and parseable, trust it (assume already accounts for breaks)
-        # - else compute diff between logout/login minus break
-        if th is not None and not (isinstance(th, float) and np.isnan(th)):
-            hrs = float(th)
+        if total_h is not None and not (isinstance(total_h, float) and np.isnan(total_h)):
+            hrs = float(total_h)
         elif lt is not None and ot is not None:
             diff = (shift_end - shift_start).total_seconds() / 3600.0
             hrs = max(diff - (br / 60.0), 0.0)
@@ -310,179 +396,67 @@ def standardise_timesheet_df(df_any: pd.DataFrame) -> pd.DataFrame:
         start_list.append(shift_start)
         end_list.append(shift_end)
 
-    df["Hours"] = hours_list
-    df["ShiftStart"] = start_list
-    df["ShiftEnd"] = end_list
+    out = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(df["D"]),
+            "ShiftStart": start_list,
+            "ShiftEnd": end_list,
+            "BreakMinutes": df["BreakMinutes"].astype(int),
+            "Hours": hours_list,
+        }
+    )
 
-    out = df[["EmployeeDate", "ShiftStart", "ShiftEnd", "BreakMinutes", "Hours"]].copy()
-    out = out.rename(columns={"EmployeeDate": "Date"})
+    # Keep rows where at least Date + (Hours or times) exist
     out = out.dropna(subset=["Date"]).copy()
-    out["Date"] = pd.to_datetime(out["Date"])
-    return out
-
-
-def get_nz_public_holidays(years: List[int]) -> Dict[date, str]:
-    """
-    Uses holidays package if available. Returns map {date: name}.
-    """
-    try:
-        import holidays  # type: ignore
-        nz = holidays.country_holidays("NZ", years=years)
-        return {d: str(name) for d, name in nz.items()}
-    except Exception:
-        return {}
-
-
-def annual_income_tax(income_annual: float) -> float:
-    tax = 0.0
-    for lo, hi, rate in TAX_BRACKETS_FROM_2025_04_01:
-        if income_annual > lo:
-            taxable = min(income_annual, hi) - lo
-            tax += taxable * rate
-        else:
-            break
-    return tax
-
-
-def compute_paye_fortnightly(gross_fortnight: float) -> float:
-    """
-    PAYE ≈ (annual income tax + annual ACC levy) / 26 with conservative cent-flooring.
-    """
-    annual_income = gross_fortnight * PAY_PERIODS_PER_YEAR
-    tax_a = annual_income_tax(annual_income)
-    acc_a = min(annual_income, ACC_MAX_EARNINGS) * ACC_EARNERS_LEVY_RATE
-
-    # conservative flooring to cents on annual components
-    tax_a = _floor2(tax_a)
-    acc_a = _floor2(acc_a)
-
-    paye = (tax_a + acc_a) / PAY_PERIODS_PER_YEAR
-    return _floor2(paye)
-
-
-@dataclass
-class EmpSettings:
-    payroll_name: str
-    hourly_rate: float
-    apply_holiday_pay: bool
-    holiday_pay_rate: float  # e.g. 0.08
-    apply_public_holiday_rules: bool
-    tax_code: str  # currently informational
-    # future: KiwiSaver, student loan, etc.
-
-
-def parse_pay_summary_pdf(pdf_bytes: bytes) -> Dict[str, Dict[str, float]]:
-    """
-    Very lightweight parser for your processed pay summary PDF to support validation/QA.
-    Returns:
-      {
-        "Employee Name": {"Gross": ..., "PAYE": ..., "TakeHome": ..., "Days": ..., "OrdHours": ..., "Rate": ..., "HolidayPay": ...}
-      }
-    """
-    out: Dict[str, Dict[str, float]] = {}
-    try:
-        from pypdf import PdfReader  # type: ignore
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    except Exception:
-        return out
-
-    # Normalize spaces
-    t = re.sub(r"[ \t]+", " ", text)
-
-    # Employee blocks: Name then numbers, depends on formatting.
-    # We'll specifically extract patterns visible in your PDF.
-    # Example: "Gaurav Sachin Kolwankar 1,231.20 1,037.20 8"
-    emp_header_pat = re.compile(r"([A-Za-z][A-Za-z ]+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+(\d+)")
-    for m in emp_header_pat.finditer(t):
-        name = m.group(1).strip()
-        gross = float(m.group(2).replace(",", ""))
-        take = float(m.group(3).replace(",", ""))
-        days = float(m.group(4))
-        out[name] = {"Gross": gross, "TakeHome": take, "Days": days}
-
-    # Ordinary hours lines: "Ordinary Hours 47.50 hours 24.00 1,140.00"
-    ord_pat = re.compile(r"Ordinary Hours\s+(\d+(?:\.\d+)?)\s+hours\s+(\d+(?:\.\d+)?)\s+([\d,]+\.\d{2})")
-    ord_matches = ord_pat.findall(t)
-
-    # Holiday pay line: "Holiday Pay 8% 91.20"
-    hol_pat = re.compile(r"Holiday Pay\s+(\d+)%\s+(\d+(?:\.\d+)?)")
-
-    # PAYE line: "PAYE (194.00)"
-    paye_pat = re.compile(r"PAYE\s+\((\d+(?:\.\d+)?)\)")
-
-    # We attach these sequentially per employee appearance (best-effort).
-    emp_names = list(out.keys())
-    emp_idx = 0
-
-    for oh, rate, total in ord_matches:
-        if emp_idx >= len(emp_names):
-            break
-        nm = emp_names[emp_idx]
-        out[nm]["OrdHours"] = float(oh)
-        out[nm]["Rate"] = float(rate)
-        out[nm]["OrdPay"] = float(total.replace(",", ""))
-        emp_idx += 1
-
-    # Holiday pay may exist only for some employees; assign by proximity: try per employee name in text segment.
-    for nm in emp_names:
-        # search within a window after the name
-        pos = t.find(nm)
-        if pos >= 0:
-            seg = t[pos : pos + 600]
-            mh = hol_pat.search(seg)
-            if mh:
-                out[nm]["HolidayPayRatePct"] = float(mh.group(1))
-                out[nm]["HolidayPay"] = float(mh.group(2))
-
-            mp = paye_pat.search(seg)
-            if mp:
-                out[nm]["PAYE"] = float(mp.group(1))
+    # Remove rows with no hours and no times
+    out = out[~(out["Hours"].isna() & out["ShiftStart"].isna() & out["ShiftEnd"].isna())].copy()
 
     return out
 
 
 def compute_overlaps(shifts: pd.DataFrame) -> pd.DataFrame:
     """
-    shifts columns: Employee, ShiftStart, ShiftEnd, Date, Hours
-    Returns overlaps with minutes.
+    shifts columns: Employee, ShiftStart, ShiftEnd
+    Returns overlaps:
+      Date, EmployeeA, EmployeeB, OverlapStart, OverlapEnd, OverlapHours
     """
-    rows = []
     if shifts.empty:
         return pd.DataFrame(columns=["Date", "EmployeeA", "EmployeeB", "OverlapStart", "OverlapEnd", "OverlapHours"])
 
-    # Compare per date bucket (use start date)
-    shifts = shifts.copy()
-    shifts["DateKey"] = shifts["ShiftStart"].dt.date
+    s = shifts.dropna(subset=["ShiftStart", "ShiftEnd"]).copy()
+    if s.empty:
+        return pd.DataFrame(columns=["Date", "EmployeeA", "EmployeeB", "OverlapStart", "OverlapEnd", "OverlapHours"])
 
-    for d, grp in shifts.groupby("DateKey"):
+    s["DateKey"] = s["ShiftStart"].dt.date
+    rows = []
+
+    for d, grp in s.groupby("DateKey"):
         grp = grp.sort_values("ShiftStart")
         arr = grp.to_dict("records")
         for i in range(len(arr)):
             for j in range(i + 1, len(arr)):
                 a = arr[i]
                 b = arr[j]
-                # if different employees
                 if a["Employee"] == b["Employee"]:
                     continue
-                s = max(a["ShiftStart"], b["ShiftStart"])
-                e = min(a["ShiftEnd"], b["ShiftEnd"])
-                if pd.isna(s) or pd.isna(e):
-                    continue
-                if e > s:
-                    oh = (e - s).total_seconds() / 3600.0
+                start = max(a["ShiftStart"], b["ShiftStart"])
+                end = min(a["ShiftEnd"], b["ShiftEnd"])
+                if end > start:
+                    oh = (end - start).total_seconds() / 3600.0
                     rows.append(
                         {
                             "Date": d,
                             "EmployeeA": a["Employee"],
                             "EmployeeB": b["Employee"],
-                            "OverlapStart": s,
-                            "OverlapEnd": e,
+                            "OverlapStart": start,
+                            "OverlapEnd": end,
                             "OverlapHours": round(oh, 2),
                         }
                     )
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows).sort_values(["Date", "OverlapStart"]) if rows else pd.DataFrame(
+        columns=["Date", "EmployeeA", "EmployeeB", "OverlapStart", "OverlapEnd", "OverlapHours"]
+    )
 
 
 def make_export_excel(summary_df: pd.DataFrame, details_by_emp: Dict[str, pd.DataFrame], overlaps_df: pd.DataFrame) -> bytes:
@@ -496,73 +470,92 @@ def make_export_excel(summary_df: pd.DataFrame, details_by_emp: Dict[str, pd.Dat
     return output.getvalue()
 
 
+@dataclass
+class EmpSettings:
+    payroll_name: str
+    hourly_rate: float
+    apply_holiday_pay: bool
+    holiday_pay_rate: float  # e.g. 0.08
+    apply_public_holiday_rules: bool
+    tax_code: str  # informational only in this version
+
+
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="LiquorPanda Timesheet → Payroll (NZ, Fortnightly)", layout="wide")
+st.set_page_config(page_title="BB Timesheet → Payroll (NZ, Fortnightly)", layout="wide")
 
-st.title("LiquorPanda Timesheet → Payroll (NZ, Fortnightly)")
-
+st.title("BB Timesheet → Payroll (NZ, Fortnightly)")
 st.caption(
-    "Reads an Excel workbook with one sheet per employee, calculates hours, detects overlaps, "
-    "and produces a PAYE-based pay summary."
+    "Upload an Excel workbook (one sheet per employee). The app parses shifts, computes pay for the selected fortnight, "
+    "checks overlaps, and exports a pay summary."
 )
-st.caption("Created by Liju Varghese (Aitechs Solutions)")
 
-
-with st.expander("Reference: your processed pay summary (for QA)"):
-    st.write(
-        "Your provided pay summary shows for 30 Nov 2025 – 13 Dec 2025: "
-        "Gaurav has 47.50 ordinary hours at $24 with 8% holiday pay, and Saurav has 97.00 hours at $28. "
-        "PAYE and take-home are listed there for comparison."
-    )
-
-# Uploads
-col_up1, col_up2 = st.columns([2, 1])
-with col_up1:
-    xls_file = st.file_uploader("Upload timesheet Excel (.xlsx)", type=["xlsx"])
-with col_up2:
-    pdf_file = st.file_uploader("Optional: Upload processed pay summary PDF (for validation)", type=["pdf"])
-
+# Upload workbook
+xls_file = st.file_uploader("Upload timesheet workbook (.xlsx)", type=["xlsx"])
 if not xls_file:
-    st.info("Upload your timesheet Excel file to begin.")
+    st.info("Upload a timesheet workbook to begin.")
     st.stop()
 
-# Cycle selection (anchor-based)
+xls_bytes = xls_file.getvalue()
+
+# Read workbook sheets
+try:
+    xl = pd.ExcelFile(io.BytesIO(xls_bytes))
+    sheetnames = xl.sheet_names
+except Exception as e:
+    st.error(f"Could not read the Excel file: {e}")
+    st.stop()
+
+# Sidebar: cycle selection (supports any past/future date)
 st.sidebar.header("Pay Cycle (Fortnight)")
-anchor = st.sidebar.date_input("Anchor cycle start date", value=date(2025, 11, 30))
-cycle_index = st.sidebar.number_input(
-    "Cycle index (0 = anchor fortnight, 1 = next, -1 = previous)",
-    min_value=-200,
-    max_value=200,
-    value=0,
-    step=1,
+
+anchor = st.sidebar.date_input(
+    "Anchor cycle start date (known fortnight start)",
+    value=date(2025, 11, 30),
+    help="This must be a real start date of your payroll fortnight. All past/future cycles align to this anchor.",
 )
-cycle_start = anchor + timedelta(days=int(cycle_index) * 14)
-cycle_end = cycle_start + timedelta(days=13)
+
+mode = st.sidebar.radio(
+    "Cycle selection method",
+    ["Pick a date (auto)", "Manual cycle index"],
+    index=0,
+)
+
+if mode == "Pick a date (auto)":
+    any_date = st.sidebar.date_input(
+        "Pick any date inside the cycle you want (works for past years too)",
+        value=date.today(),
+    )
+    cycle_index, cycle_start, cycle_end = cycle_from_date(anchor, any_date)
+    st.sidebar.write(f"Auto cycle index: **{cycle_index}**")
+else:
+    cycle_index = st.sidebar.number_input(
+        "Cycle index (0 = anchor fortnight)",
+        min_value=-5000,
+        max_value=5000,
+        value=0,
+        step=1,
+    )
+    cycle_start = anchor + timedelta(days=int(cycle_index) * 14)
+    cycle_end = cycle_start + timedelta(days=13)
+
 st.sidebar.write(f"**Cycle:** {cycle_start} → {cycle_end} (14 days)")
 
-# Read workbook
-xls_bytes = xls_file.getvalue()
-xl = pd.ExcelFile(io.BytesIO(xls_bytes))
-sheetnames = xl.sheet_names
+# Sheet selection (default: all sheets)
+st.subheader("1) Select employee sheets")
+default_sheets = sheetnames  # safest for older formats
+chosen_sheets = st.multiselect("Sheets to include", options=sheetnames, default=default_sheets)
 
-# Pick timesheet-like sheets automatically, allow override
-auto_timesheet_sheets = [s for s in sheetnames if re.search(r"\btime\s*sheet\b|\btimesheet\b", s, flags=re.IGNORECASE)]
-if not auto_timesheet_sheets:
-    auto_timesheet_sheets = sheetnames
+if not chosen_sheets:
+    st.warning("Select at least one sheet.")
+    st.stop()
 
-chosen_sheets = st.multiselect(
-    "Sheets to include (employee sheets)",
-    options=sheetnames,
-    default=auto_timesheet_sheets,
-)
-
-# Load & standardise all selected sheets
+# Parse selected sheets
 emp_frames: Dict[str, pd.DataFrame] = {}
+parse_errors: Dict[str, str] = {}
+
 for sh in chosen_sheets:
-    if sh.strip().lower() in {"daily sales", "sheet1", "sheet2"}:
-        continue  # skip obvious non-timesheet sheets
     try:
         df_sh = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sh)
         emp = normalise_sheet_name_to_employee(sh)
@@ -570,59 +563,75 @@ for sh in chosen_sheets:
         df_std["Employee"] = emp
         emp_frames[emp] = df_std
     except Exception as e:
-        st.warning(f"Could not read sheet '{sh}': {e}")
+        parse_errors[sh] = str(e)
+
+if parse_errors:
+    with st.expander("Sheet parse warnings (click to expand)"):
+        for sh, msg in parse_errors.items():
+            st.warning(f"{sh}: {msg}")
 
 if not emp_frames:
-    st.error("No usable employee sheets found.")
+    st.error("No usable sheets were parsed. This workbook format may be too different. Use Diagnostics below to inspect.")
     st.stop()
 
-# Combine and filter by cycle
+# Combine all shifts
 all_shifts = pd.concat(emp_frames.values(), ignore_index=True)
-all_shifts = all_shifts.dropna(subset=["ShiftStart", "ShiftEnd"])
-all_shifts["Date"] = all_shifts["ShiftStart"].dt.date
-mask = (all_shifts["ShiftStart"].dt.date >= cycle_start) & (all_shifts["ShiftStart"].dt.date <= cycle_end)
+
+# Add shift timestamps where possible
+# (some rows may have Hours only; keep them but overlaps require ShiftStart/ShiftEnd)
+all_shifts["ShiftStart"] = pd.to_datetime(all_shifts["ShiftStart"], errors="coerce")
+all_shifts["ShiftEnd"] = pd.to_datetime(all_shifts["ShiftEnd"], errors="coerce")
+all_shifts["DateOnly"] = all_shifts["Date"].dt.date
+
+# Filter to cycle
+mask = (all_shifts["DateOnly"] >= cycle_start) & (all_shifts["DateOnly"] <= cycle_end)
 cycle_shifts = all_shifts.loc[mask].copy()
 
-# Holidays
+# Public holidays
 years_needed = sorted({cycle_start.year, cycle_end.year})
 holiday_map = get_nz_public_holidays(years_needed)
-cycle_shifts["IsPublicHoliday"] = cycle_shifts["Date"].apply(lambda d: d in holiday_map)
-cycle_shifts["HolidayName"] = cycle_shifts["Date"].apply(lambda d: holiday_map.get(d, ""))
+cycle_shifts["IsPublicHoliday"] = cycle_shifts["DateOnly"].apply(lambda d: d in holiday_map)
+cycle_shifts["HolidayName"] = cycle_shifts["DateOnly"].apply(lambda d: holiday_map.get(d, ""))
 
-# Employee settings table
-st.sidebar.header("Employee Settings")
+# Quick metrics
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Cycle start", str(cycle_start))
+c2.metric("Cycle end", str(cycle_end))
+c3.metric("Employees parsed", str(len(emp_frames)))
+c4.metric("Shift rows in cycle", str(len(cycle_shifts)))
+
+# Diagnostics for “old timesheet didn’t work”
+with st.expander("Diagnostics (use if an old timesheet does not parse)"):
+    st.write("Chosen sheets:", chosen_sheets)
+    st.write("Detected employees:", sorted(emp_frames.keys()))
+    st.write("Parsed shifts (first 50 rows):")
+    st.dataframe(cycle_shifts.head(50), use_container_width=True)
+
+# Employee settings editor
+st.subheader("2) Enter employee settings (rates and rules)")
 default_rows = []
 for emp in sorted(emp_frames.keys()):
-    # pragmatic defaults (edit in UI)
-    rate_guess = 0.0
-    # basic hints
-    if emp.strip().lower() == "gaurav":
-        rate_guess = 24.0
-    if emp.strip().lower() == "saurav":
-        rate_guess = 28.0
     default_rows.append(
         {
             "Sheet/Employee": emp,
-            "Payroll Name": emp,  # you can expand to full name
-            "Hourly Rate": rate_guess,
-            "Apply Holiday Pay (8%)": (emp.strip().lower() == "gaurav"),
+            "Payroll Name": emp,
+            "Hourly Rate": 0.0,
+            "Apply Holiday Pay (8%)": False,
             "Holiday Pay Rate": 0.08,
-            "Apply Public Holiday Rules": True,
+            "Apply Public Holiday Rules (1.5x if worked)": True,
             "Tax Code": "M",
         }
     )
 
-settings_df = pd.DataFrame(default_rows)
-
-settings_df = st.sidebar.data_editor(
-    settings_df,
+settings_df = st.data_editor(
+    pd.DataFrame(default_rows),
     hide_index=True,
     use_container_width=True,
     column_config={
         "Hourly Rate": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.2f"),
         "Holiday Pay Rate": st.column_config.NumberColumn(min_value=0.0, max_value=0.2, step=0.01, format="%.2f"),
         "Apply Holiday Pay (8%)": st.column_config.CheckboxColumn(),
-        "Apply Public Holiday Rules": st.column_config.CheckboxColumn(),
+        "Apply Public Holiday Rules (1.5x if worked)": st.column_config.CheckboxColumn(),
     },
 )
 
@@ -633,49 +642,47 @@ for _, r in settings_df.iterrows():
         hourly_rate=float(r["Hourly Rate"] or 0.0),
         apply_holiday_pay=bool(r["Apply Holiday Pay (8%)"]),
         holiday_pay_rate=float(r["Holiday Pay Rate"] or 0.0),
-        apply_public_holiday_rules=bool(r["Apply Public Holiday Rules"]),
+        apply_public_holiday_rules=bool(r["Apply Public Holiday Rules (1.5x if worked)"]),
         tax_code=str(r["Tax Code"] or "M"),
     )
 
-# Validate rates
 missing_rates = [emp for emp, s in settings_map.items() if s.hourly_rate <= 0]
 if missing_rates:
-    st.warning(f"Set Hourly Rate for: {', '.join(missing_rates)} (left sidebar).")
+    st.warning("Set Hourly Rate for: " + ", ".join(missing_rates))
 
-# Overlaps
-overlaps_df = compute_overlaps(cycle_shifts[["Employee", "ShiftStart", "ShiftEnd", "Hours"]].assign(Date=cycle_shifts["Date"]))
-overlaps_df = overlaps_df.sort_values(["Date", "OverlapStart"]) if not overlaps_df.empty else overlaps_df
+# Compute overlaps (only possible where shift times exist)
+overlaps_df = compute_overlaps(
+    cycle_shifts[["Employee", "ShiftStart", "ShiftEnd"]].copy()
+)
 
 # Compute pay per employee
 summary_rows = []
 details_by_emp: Dict[str, pd.DataFrame] = {}
 
+# Group even if some rows only have Hours
 for emp, grp in cycle_shifts.groupby("Employee"):
     s = settings_map.get(emp, EmpSettings(emp, 0.0, False, 0.08, True, "M"))
     g = grp.copy()
 
-    # hours buckets
+    # If Hours is missing, treat as 0 to avoid NaN sum surprises
+    g["Hours"] = pd.to_numeric(g["Hours"], errors="coerce").fillna(0.0)
+
+    # buckets
     ph_hours = float(g.loc[g["IsPublicHoliday"], "Hours"].sum())
     normal_hours = float(g.loc[~g["IsPublicHoliday"], "Hours"].sum())
 
-    # pay buckets
     rate = float(s.hourly_rate)
     ordinary_pay = normal_hours * rate
-
-    if s.apply_public_holiday_rules:
-        public_holiday_pay = ph_hours * rate * 1.5
-    else:
-        public_holiday_pay = ph_hours * rate  # treat as ordinary
+    public_holiday_pay = ph_hours * rate * (1.5 if s.apply_public_holiday_rules else 1.0)
 
     holiday_pay = (ordinary_pay + public_holiday_pay) * float(s.holiday_pay_rate) if s.apply_holiday_pay else 0.0
 
     gross = ordinary_pay + public_holiday_pay + holiday_pay
 
-    # PAYE (approx; close to IRD tables for standard cases)
     paye = compute_paye_fortnightly(gross)
     take_home = gross - paye
 
-    days_paid = int((g["Hours"].fillna(0) > 0).sum())
+    days_paid = int((g["Hours"] > 0).sum())
 
     summary_rows.append(
         {
@@ -689,15 +696,14 @@ for emp, grp in cycle_shifts.groupby("Employee"):
             "Public Holiday Pay": round(public_holiday_pay, 2),
             "Holiday Pay": round(holiday_pay, 2),
             "Gross Pay": round(gross, 2),
-            "PAYE": round(paye, 2),
+            "PAYE (approx)": round(paye, 2),
             "Take Home": round(take_home, 2),
             "Tax Code": s.tax_code,
         }
     )
 
-    # detail view
+    # detail
     g2 = g.copy()
-    g2["ShiftHours"] = g2["Hours"].round(2)
     g2["PayType"] = np.where(g2["IsPublicHoliday"], "Public Holiday", "Ordinary")
     g2["BasePay"] = np.where(
         g2["IsPublicHoliday"],
@@ -705,89 +711,47 @@ for emp, grp in cycle_shifts.groupby("Employee"):
         g2["Hours"] * rate,
     )
     g2["BasePay"] = g2["BasePay"].round(2)
+    g2["Date"] = g2["Date"].dt.date
+
     details_by_emp[emp] = g2[
-        ["Employee", "ShiftStart", "ShiftEnd", "Date", "ShiftHours", "PayType", "HolidayName", "BasePay"]
-    ].sort_values("ShiftStart")
+        ["Employee", "Date", "ShiftStart", "ShiftEnd", "BreakMinutes", "Hours", "PayType", "HolidayName", "BasePay"]
+    ].sort_values(["Date", "ShiftStart"], na_position="last")
 
-summary_df = pd.DataFrame(summary_rows).sort_values("Employee (Sheet)")
+summary_df = pd.DataFrame(summary_rows)
 
-# Top metrics
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Cycle start", str(cycle_start))
-c2.metric("Cycle end", str(cycle_end))
-c3.metric("Employees included", str(summary_df.shape[0]))
-c4.metric("Overlap instances", str(0 if overlaps_df.empty else overlaps_df.shape[0]))
+# Guard: old timesheet might parse nothing in a cycle → avoid KeyError
+if summary_df.empty:
+    st.error(
+        "No payable shifts were detected for the selected cycle. "
+        "This usually means the old timesheet has different headers or date/time formats."
+    )
+    st.write("Try:")
+    st.write("- Select a different sheet set")
+    st.write("- Use Diagnostics to see parsed rows")
+    st.write("- Check the anchor date and the picked cycle date")
+    st.stop()
 
-st.subheader("Pay Run Summary (computed)")
+summary_df = summary_df.sort_values("Employee (Sheet)")
+
+# Display summary + overlaps
+st.subheader("3) Pay run summary (computed)")
 st.dataframe(summary_df, use_container_width=True)
 
-st.subheader("Overlaps (same time, different employees)")
+st.subheader("4) Overlaps (same time, different employees)")
 if overlaps_df.empty:
-    st.success("No overlaps detected in this cycle.")
+    st.success("No overlaps detected (or shift times were not available in the old format).")
 else:
     st.dataframe(overlaps_df, use_container_width=True)
 
-# Optional PDF validation
-if pdf_file:
-    st.subheader("Validation vs Processed Pay Summary PDF")
-    pdf_bytes = pdf_file.getvalue()
-    parsed = parse_pay_summary_pdf(pdf_bytes)
-
-    if not parsed:
-        st.warning("Could not parse the PDF text (try exporting as text-based PDF, not scanned).")
-    else:
-        # Build comparison table by matching payroll name
-        comp_rows = []
-        for _, r in summary_df.iterrows():
-            payroll_name = r["Employee (Payroll)"]
-            # exact or contains match
-            match_key = None
-            for k in parsed.keys():
-                if k.strip().lower() == str(payroll_name).strip().lower():
-                    match_key = k
-                    break
-            if not match_key:
-                for k in parsed.keys():
-                    if str(payroll_name).strip().lower() in k.strip().lower() or k.strip().lower() in str(payroll_name).strip().lower():
-                        match_key = k
-                        break
-
-            if not match_key:
-                continue
-
-            exp = parsed[match_key]
-            comp_rows.append(
-                {
-                    "Employee (Payroll)": payroll_name,
-                    "Expected Gross": exp.get("Gross", np.nan),
-                    "Computed Gross": r["Gross Pay"],
-                    "Diff Gross": round(float(r["Gross Pay"]) - float(exp.get("Gross", 0.0)), 2),
-                    "Expected PAYE": exp.get("PAYE", np.nan),
-                    "Computed PAYE": r["PAYE"],
-                    "Diff PAYE": round(float(r["PAYE"]) - float(exp.get("PAYE", 0.0)), 2),
-                    "Expected TakeHome": exp.get("TakeHome", np.nan),
-                    "Computed TakeHome": r["Take Home"],
-                    "Diff TakeHome": round(float(r["Take Home"]) - float(exp.get("TakeHome", 0.0)), 2),
-                    "Expected Days": exp.get("Days", np.nan),
-                    "Computed Days": r["Days Paid"],
-                }
-            )
-
-        if comp_rows:
-            comp_df = pd.DataFrame(comp_rows)
-            st.dataframe(comp_df, use_container_width=True)
-        else:
-            st.info("No matching employees found between computed summary and PDF names. Update Payroll Name in settings.")
-
 # Employee details
-st.subheader("Employee Shift Details (cycle)")
+st.subheader("5) Employee shift details (cycle)")
 tabs = st.tabs([emp for emp in sorted(details_by_emp.keys())])
 for tab, emp in zip(tabs, sorted(details_by_emp.keys())):
     with tab:
         st.dataframe(details_by_emp[emp], use_container_width=True)
 
 # Export
-st.subheader("Export")
+st.subheader("6) Export")
 export_bytes = make_export_excel(summary_df, details_by_emp, overlaps_df)
 st.download_button(
     "Download Excel (Pay Summary + Overlaps + Employee Details)",
@@ -797,10 +761,6 @@ st.download_button(
 )
 
 st.caption(
-    "Public holiday identification uses the Python 'holidays' library where available. "
-    "Public holiday pay is calculated as 1.5x for worked hours; alternative day accrual is noted conceptually but not booked as cash."
+    "Notes: PAYE is computed using an annualised bracket approximation plus ACC levy. "
+    "If you need exact cent-matching with Xero/IRD fortnightly tables, upgrade to IR340 table lookup."
 )
-
-
-
-
